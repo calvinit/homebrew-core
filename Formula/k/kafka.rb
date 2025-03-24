@@ -1,9 +1,9 @@
 class Kafka < Formula
   desc "Open-source distributed event streaming platform"
   homepage "https://kafka.apache.org/"
-  url "https://www.apache.org/dyn/closer.lua?path=kafka/3.9.0/kafka_2.13-3.9.0.tgz"
-  mirror "https://archive.apache.org/dist/kafka/3.9.0/kafka_2.13-3.9.0.tgz"
-  sha256 "abc44402ddf103e38f19b0e4b44e65da9a831ba9e58fd7725041b1aa168ee8d1"
+  url "https://www.apache.org/dyn/closer.lua?path=kafka/4.0.0/kafka_2.13-4.0.0.tgz"
+  mirror "https://archive.apache.org/dist/kafka/4.0.0/kafka_2.13-4.0.0.tgz"
+  sha256 "7b852e938bc09de10cd96eca3755258c7d25fb89dbdd76305717607e1835e2aa"
   license "Apache-2.0"
 
   livecheck do
@@ -21,24 +21,22 @@ class Kafka < Formula
   end
 
   depends_on "openjdk"
-  depends_on "zookeeper"
 
   def install
-    data = var/"lib"
+    data = var/"lib/kafka"
+
     inreplace "config/server.properties",
-      "log.dirs=/tmp/kafka-logs", "log.dirs=#{data}/kafka-logs"
+              "log.dirs=/tmp/kraft-combined-logs", "log.dirs=#{data}/kraft-combined-logs"
 
-    inreplace "config/kraft/server.properties",
-      "log.dirs=/tmp/kraft-combined-logs", "log.dirs=#{data}/kraft-combined-logs"
+    inreplace "config/controller.properties",
+              "log.dirs=/tmp/kraft-controller-logs", "log.dirs=#{data}/kraft-controller-logs"
 
-    inreplace "config/kraft/controller.properties",
-      "log.dirs=/tmp/kraft-controller-logs", "log.dirs=#{data}/kraft-controller-logs"
+    inreplace "config/connect-standalone.properties",
+              "offset.storage.file.filename=/tmp/connect.offsets",
+              "offset.storage.file.filename=#{data}/connect.offsets"
 
-    inreplace "config/kraft/broker.properties",
-      "log.dirs=/tmp/kraft-broker-logs", "log.dirs=#{data}/kraft-broker-logs"
-
-    inreplace "config/zookeeper.properties",
-      "dataDir=/tmp/zookeeper", "dataDir=#{data}/zookeeper"
+    inreplace "config/broker.properties",
+              "log.dirs=/tmp/kraft-broker-logs", "log.dirs=#{data}/kraft-broker-logs"
 
     # remove Windows scripts
     rm_r("bin/windows")
@@ -58,7 +56,18 @@ class Kafka < Formula
   end
 
   service do
-    run [opt_bin/"kafka-server-start", etc/"kafka/server.properties"]
+    storage = opt_bin/"kafka-storage"
+    server_config = etc/"kafka/server.properties"
+    meta_file = var/"lib/kafka/kraft-combined-logs/meta.properties"
+
+    unless File.exist?(meta_file)
+      cluster_id = `#{storage} random-uuid`
+      system storage, "format", "--standalone", "-c", server_config, "-t", cluster_id
+      ohai "Kafka storage formatted with KAFKA_CLUSTER_ID=#{cluster_id}"
+    end
+
+    run [opt_bin/"kafka-server-start", server_config]
+
     keep_alive true
     working_dir HOMEBREW_PREFIX
     log_path var/"log/kafka/kafka_output.log"
@@ -68,31 +77,25 @@ class Kafka < Formula
   test do
     ENV["LOG_DIR"] = "#{testpath}/kafkalog"
 
-    # Workaround for https://issues.apache.org/jira/browse/KAFKA-15413
-    # See https://github.com/Homebrew/homebrew-core/pull/133887#issuecomment-1679907729
-    ENV.delete "COLUMNS"
-
     (testpath/"kafka").mkpath
-    cp "#{etc}/kafka/zookeeper.properties", testpath/"kafka"
     cp "#{etc}/kafka/server.properties", testpath/"kafka"
-    inreplace "#{testpath}/kafka/zookeeper.properties", "#{var}/lib", testpath
-    inreplace "#{testpath}/kafka/server.properties", "#{var}/lib", testpath
+    inreplace "#{testpath}/kafka/server.properties", "#{var}/lib/kafka", testpath
 
-    zk_port = free_port
-    kafka_port = free_port
-    inreplace "#{testpath}/kafka/zookeeper.properties", "clientPort=2181", "clientPort=#{zk_port}"
+    kafka_port, controller_port = free_port, free_port
     inreplace "#{testpath}/kafka/server.properties" do |s|
-      s.gsub! "zookeeper.connect=localhost:2181", "zookeeper.connect=localhost:#{zk_port}"
-      s.gsub! "#listeners=PLAINTEXT://:9092", "listeners=PLAINTEXT://:#{kafka_port}"
+      s.gsub! "controller.quorum.bootstrap.servers=localhost:9093",
+              "controller.quorum.bootstrap.servers=localhost:#{controller_port}"
+      s.gsub! "listeners=PLAINTEXT://:9092,CONTROLLER://:9093",
+              "listeners=PLAINTEXT://:#{kafka_port},CONTROLLER://:#{controller_port}"
+      s.gsub! "advertised.listeners=PLAINTEXT://localhost:9092,CONTROLLER://localhost:9093",
+              "advertised.listeners=PLAINTEXT://localhost:#{kafka_port},CONTROLLER://localhost:#{controller_port}"
     end
 
     begin
-      fork do
-        exec "#{bin}/zookeeper-server-start #{testpath}/kafka/zookeeper.properties " \
-             "> #{testpath}/test.zookeeper-server-start.log 2>&1"
-      end
+      cluster_id = `#{bin}/kafka-storage random-uuid`
 
-      sleep 15
+      system "#{bin}/kafka-storage format --standalone -c #{testpath}/kafka/server.properties -t #{cluster_id} "\
+             "> #{testpath}/test.kafka-storage.log 2>&1"
 
       fork do
         exec "#{bin}/kafka-server-start #{testpath}/kafka/server.properties " \
@@ -112,7 +115,6 @@ class Kafka < Formula
              ">> #{testpath}/kafka/demo.out 2>/dev/null"
     ensure
       system bin/"kafka-server-stop"
-      system bin/"zookeeper-server-stop"
       sleep 10
     end
 
